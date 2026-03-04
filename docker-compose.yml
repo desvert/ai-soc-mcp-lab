@@ -1,0 +1,10 @@
+services:
+  netparse:
+    build: ./netparse
+    container_name: mcp-netparse
+    stdin_open: true
+    tty: true
+    network_mode: "none"
+    user: "1000:1000"
+    volumes:
+      - /srv/evidence:/evidence:ro
