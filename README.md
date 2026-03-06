@@ -1,163 +1,207 @@
 # AI-Assisted SOC Triage Lab (Claude + MCP + Docker)
 
-This project explores a simple idea:
+This lab explores a simple idea: use an LLM as a junior analyst, but rely on deterministic tools for the actual evidence.
 
-Use an LLM as a junior analyst, but rely on deterministic tools for evidence.
+Instead of asking an AI to "analyze a PCAP," this project exposes a set of network analysis tools via the Model Context Protocol (MCP). Claude Code calls those tools, inspects the structured results, and writes a triage note grounded in real tool output.
 
-Instead of asking an AI to “analyze a PCAP”, this lab exposes a set of network analysis tools via the Model Context Protocol (MCP). Claude can call those tools, inspect the results, and then write a triage note.
+The goal is not full automation. It is assisted investigation with verifiable evidence.
 
-The goal is not full automation. The goal is assisted investigation with verifiable evidence.
+For the full writeup and background on why this was built this way, see the [blog post](https://desvert.github.io/blog/2026/03/04/building-an-ai-assisted-soc-triage-lab.html).
 
+---
 
 ## Architecture
+
 ```
 Claude Code
    ↓
 MCP tools (netparse)
    ↓
-Docker container
+Docker container (network disabled, non-root, read-only mounts)
    ↓
 tshark / parsers
    ↓
-Evidence directory (`/srv/evidence`)
+/srv/evidence (read-only)
 ```
 
-Key principles:
+Key design principles:
 
-- Deterministic parsing (tshark) for packet analysis
-- LLM for reasoning and reporting
-- Containerized tools for isolation and reproducibility
-- Read-only evidence access
+- **tshark** does the deterministic packet parsing
+- **MCP tools** wrap tshark output into structured JSON
+- **Claude** reasons over that JSON and writes the triage note
+- The container has no network access and cannot write back to evidence
 
+---
 
-## Project Goals
+## Requirements
 
-This lab is intended to demonstrate:
+- Docker and Docker Compose
+- Claude Code (with MCP support)
+- Evidence directory at `/srv/evidence` (or adjust the volume mount in `docker-compose.yml`)
 
-- A practical use of the Model Context Protocol
-- How AI can assist SOC triage workflows
-- How to keep investigations evidence-driven
-- A repeatable architecture for AI + security tooling
+---
 
+## Setup
+
+**1. Clone the repository**
+
+```bash
+git clone https://github.com/desvert/ai-soc-mcp-lab
+cd ai-soc-mcp-lab
+```
+
+**2. Build the container**
+
+```bash
+docker compose build
+```
+
+**3. Create a case directory and drop in a PCAP**
+
+```bash
+mkdir -p /srv/evidence/soc/cases/testcase/raw
+cp your-capture.pcap /srv/evidence/soc/cases/testcase/raw/
+```
+
+**4. Register the MCP server with Claude Code**
+
+Add the following to your Claude Code MCP configuration:
+
+```json
+{
+  "mcpServers": {
+    "netparse": {
+      "command": "docker",
+      "args": [
+        "compose", "-f", "/path/to/ai-soc-mcp-lab/docker-compose.yml",
+        "run", "--rm", "-i", "netparse"
+      ]
+    }
+  }
+}
+```
+
+**5. Run a triage**
+
+In Claude Code, ask:
+
+```
+Run pcap_triage_overview on /evidence/soc/cases/testcase and write a triage note.
+```
+
+---
 
 ## Evidence Directory Structure
 
-All investigation data lives under:
+All case data lives under a single root:
+
 ```
 /srv/evidence/soc/cases/<case>/
+├── raw/            # Original evidence (PCAP, eve.json) — never modified
+├── derived/        # Outputs from tool processing
+└── reports/        # Triage notes and analyst reports
 ```
 
-Example:
-```
-/srv/evidence/soc/cases/testcase/
-├── raw/
-│ └── capture.pcap
-├── derived/
-└── reports/
-```
+The container mounts `/srv/evidence` read-only. Nothing the model does can modify original evidence.
 
-The MCP container mounts the evidence directory read-only.
-
+---
 
 ## MCP Tools
 
-The `netparse` server currently exposes the following tools:
+The `netparse` server exposes the following tools. All tools return structured JSON.
 
-### Packet analysis tools
-
-| Tool | Description |
-|-----|-------------|
-| `pcap_triage_overview` | One-call PCAP triage summary |
-| `pcap_dns_summary` | Top DNS queries and responses |
-| `pcap_http_hosts` | Top HTTP host headers |
-| `pcap_conversations` | TCP conversation summary |
-| `pcap_extract_fields` | Generic tshark field extraction |
-
-### IDS analysis
+### Packet analysis
 
 | Tool | Description |
-|-----|-------------|
-| `suricata_alerts` | Parse Suricata `eve.json` alerts |
+|------|-------------|
+| `pcap_triage_overview` | Runs DNS, HTTP, and conversation analysis in a single call. Main entry point for triage. |
+| `pcap_dns_summary` | Top queried DNS names and top A-record responses with counts |
+| `pcap_http_hosts` | Top HTTP Host header values with counts |
+| `pcap_conversations` | TCP conversation summary (tshark conv,tcp output) |
+| `pcap_extract_fields` | Generic tshark field extractor with display filter support |
 
-These tools return structured JSON which Claude can analyze.
+### IDS / alert analysis
 
+| Tool | Description |
+|------|-------------|
+| `suricata_alerts` | Parse Suricata `eve.json`; supports filtering by signature substring and minimum severity |
 
-## Example Workflow
-1. Drop PCAP into `/srv/evidence/soc/cases/testcase/raw`
+### Tool notes
 
-2. Ask Claude to triage:
+- All tools accept a `case_dir` path and operate on the first `.pcap` or `.pcapng` found in `<case_dir>/raw/`.
+- All paths are validated against the evidence root to prevent traversal.
+- `pcap_extract_fields` accepts arbitrary tshark display filters and field names, making it useful for follow-up pivots after an initial triage.
+
+---
+
+## Example: `pcap_extract_fields`
+
+For targeted follow-up after a triage overview, use `pcap_extract_fields` to pull specific fields:
 
 ```
-Run pcap_triage_overview on /evidence/soc/cases/testcase
-and generate a triage note.
+Extract fields frame.time, ip.src, ip.dst, dns.qry.name, dns.a
+from case /evidence/soc/cases/testcase
+using display filter: dns.a == "10.90.90.90"
 ```
 
-3. Claude will:
+This is how you would, for example, enumerate every domain name that resolved to a suspicious internal IP.
 
-- call the MCP tool
-- analyze the results
-- produce a structured triage report
-
+---
 
 ## Example Output
 
-Example triage notes include:
+See [`examples/testcase/triage-note-example.md`](examples/testcase/triage-note-example.md) for a full sample triage note generated from a real PCAP.
 
-- summary of network activity
-- notable DNS queries
-- unusual IP conversations
-- potential indicators of compromise
-- suggested next steps
+That example covers a Windows AD environment with an active RDP scan from an external IP, suspicious DNS patterns, anomalous internal traffic, and five graded hypotheses with suggested investigation steps.
 
-Each finding references the tool output used as evidence.
-
+---
 
 ## Security Boundaries
 
-The MCP server runs inside a Docker container with:
+The container is locked down deliberately:
 
-- read-only evidence mounts
-- network disabled
-- non-root user
+```yaml
+network_mode: "none"      # no outbound or inbound network
+user: "1000:1000"         # non-root
+volumes:
+  - /srv/evidence:/evidence:ro   # read-only evidence mount
+```
 
-This prevents the LLM from directly interacting with the host system.
+The model has no path to the host filesystem and cannot make network calls. If a capture file contains embedded prompt injection attempts, the blast radius is limited to the container context.
 
+---
 
-## Why This Approach
+## Repository Structure
 
-Packet analysis requires deterministic parsing.
+```
+.
+├── docker-compose.yml
+├── docker/
+│   └── netparse/
+│       ├── Dockerfile
+│       ├── requirements.txt
+│       └── server.py          # MCP server (FastMCP + tshark wrappers)
+├── examples/
+│   └── testcase/
+│       └── triage-note-example.md
+└── docs/
+    ├── architecture.md
+    ├── triage-workflow.md
+    └── usage.md
+```
 
-LLMs are useful for:
-
-- summarization
-- hypothesis generation
-- investigation guidance
-
-But they should not replace the underlying tools.
-
-This architecture keeps the AI focused on reasoning while leaving parsing to tools designed for it.
-
+---
 
 ## Future Work
 
-Planned improvements include:
-
-- TLS SNI analysis
-- JA3 fingerprint summaries
+- TLS SNI analysis (`tls.handshake.extensions_server_name`)
+- JA3 fingerprint extraction
 - Zeek log ingestion
 - Suricata integration with full alert filtering
-- OT protocol analysis tools
+- OT protocol analysis tools (Modbus, BACnet, DNP3)
 
+---
 
-## Motivation
+## Related
 
-This project is part of my broader exploration of:
-
-- SOC workflows
-- incident investigation
-- AI-assisted tooling
-- OT / critical infrastructure security
-
-The goal is to understand how these systems actually work in practice, not just conceptually.
-
-
+- [Blog post](https://desvert.github.io/blog/2026/03/04/building-an-ai-assisted-soc-triage-lab.html) — background, design decisions, and lessons learned
