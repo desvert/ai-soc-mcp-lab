@@ -110,7 +110,7 @@ def suricata_alerts(
     }
 
 @mcp.tool()
-def pcap_conversations(case_dir: str, limit: int = 50) -> Dict[str, Any]:
+def pcap_conversations(case_dir: str) -> Dict[str, Any]:
     raw = _find_case_raw(case_dir)
     pcaps = sorted(glob.glob(os.path.join(raw, "*.pcap"))) + sorted(glob.glob(os.path.join(raw, "*.pcapng")))
     if not pcaps:
@@ -125,14 +125,12 @@ def pcap_conversations(case_dir: str, limit: int = 50) -> Dict[str, Any]:
         raise RuntimeError(f"tshark failed: {proc.stderr.strip()}")
 
     lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
-    tail = lines[-min(len(lines), 300):]
-
+    
     return {
         "case_dir": case_dir,
         "pcap_path": pcap_path,
         "command": " ".join(cmd),
-        "output_tail_lines": tail,
-        "note": f"limit parameter not used yet; output is a tail of tshark text ({len(tail)} lines).",
+        "output_lines": lines,
     }
 
 @mcp.tool()
